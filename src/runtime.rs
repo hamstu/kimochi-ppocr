@@ -24,6 +24,7 @@ pub struct BackendInfo {
     pub fallback_reasons: Vec<String>,
 }
 fn provider(backend: Backend, device: Option<i32>) -> Result<Option<ExecutionProviderDispatch>> {
+    let _ = device; // only CUDA and DirectML take a device
     match backend {
         Backend::Cpu => Ok(None),
         #[cfg(feature = "coreml")]
