@@ -35,6 +35,12 @@ cargo test
 cargo run --release --example ocr -- models screenshot.png auto small
 ```
 
+`examples/bench.rs` is the cross-machine benchmark: cold start, warm p50/p95, peak memory and character error rate on Kimochi's overlay-alignment fixtures, for PP-OCR or MeikiOCR, ending in one `BENCH {json}` line.
+
+```sh
+cargo run --release --example bench -- --models models --backend cpu --threads 6 ../kimochi/scripts/fixtures/overlay-alignment/*.png
+```
+
 ## Licence
 
 Apache-2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)), matching PaddleOCR.
