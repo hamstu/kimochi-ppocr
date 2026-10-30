@@ -1,51 +1,80 @@
-//! The cross-platform benchmark: one process, one configuration, comparable numbers.
+//! The common benchmark: cold start, warm latency and peak memory, one engine per process.
 //!
-//! bench MODEL_DIR BACKEND RUNS IMAGE...
+//! bench [--engine ppocr|meiki] [--models DIR] [--tier small|medium|tiny]
+//!       [--backend auto|cpu|cuda|coreml|directml] [--threads N] [--cache DIR] [--runs N] [--json]
+//!       IMAGE...
 //!
-//! BACKEND is auto, cpu, coreml, cuda or directml. Environment: PPOCR_TIER (small), PPOCR_MAX_SIDE
-//! (960), PPOCR_BATCH (8), PPOCR_THREADS, PPOCR_DEVICE, PPOCR_CACHE (Core ML compiled-model cache
-//! directory) and BENCH_LABEL (a name for this configuration in the summary).
+//! Cold start is process start to the first image's result: engine load (runtime, sessions and
+//! any accelerator probe) plus that first `ocr`, less image decoding. Warm latency is every later
+//! `ocr` call, `--runs` per image (default 20), as p50/p95 per image and over all images. Peak
+//! memory is the process's peak resident set (unix only). Character error rate is reported when
+//! an image has a sibling `<stem>.truth.json` (Kimochi's scripts/fixtures/overlay-alignment). The
+//! last line, `BENCH {...}`, is the same numbers as JSON for collecting across machines.
 //!
-//! Reports, per image: the first call after load (which builds any per-shape session it needs),
-//! then detection-only and full-pipeline p50/p95 over RUNS warm calls, and the character error
-//! rate against a sibling `<stem>.truth.json` (Kimochi's overlay-alignment fixtures). Then the
-//! load time, the mean warm latency and the process's peak resident memory, also as one JSON line
-//! (`BENCH {...}`) for collecting runs across machines. Run a fresh process per configuration:
-//! the load time is only cold the first time a process loads ONNX Runtime and the models.
+//! `--cache` is PP-OCR's Core ML compiled-model cache (`Config::cache_dir`), as Kimochi sets it on
+//! macOS: run twice to see the cached load.
+//!
+//! Use the fixed image set so numbers compare across machines, from a Kimochi checkout:
+//!   bench --models MODEL_DIR scripts/fixtures/overlay-alignment/*.png
 use ppocr::{Backend, Config, ModelPaths, OcrOptions, PpOcr, Tier};
 use std::time::Instant;
-
-fn env<T: std::str::FromStr>(k: &str) -> Option<T> {
-    std::env::var(k).ok().and_then(|v| v.parse().ok())
-}
 
 fn backend(name: &str) -> Result<Backend, String> {
     Ok(match name {
         "auto" => Backend::Auto,
         "cpu" => Backend::Cpu,
-        "coreml" => Backend::CoreMl,
         "cuda" => Backend::Cuda,
+        "coreml" => Backend::CoreMl,
         "directml" => Backend::DirectMl,
         _ => return Err(format!("unknown backend {name}")),
     })
 }
-
-fn ms(t: Instant) -> f64 {
-    t.elapsed().as_secs_f64() * 1000.0
+fn meiki_backend(b: Backend) -> meikiocr::Backend {
+    match b {
+        Backend::Cpu => meikiocr::Backend::Cpu,
+        Backend::DirectMl => meikiocr::Backend::DirectMl,
+        Backend::Cuda => meikiocr::Backend::Cuda,
+        Backend::CoreMl => meikiocr::Backend::CoreMl,
+        Backend::Auto => meikiocr::Backend::Auto,
+    }
 }
 
-/// p50 and p95 of `runs` timed calls.
-fn percentiles(runs: usize, mut f: impl FnMut()) -> (f64, f64) {
-    let mut samples: Vec<f64> = (0..runs.max(1))
-        .map(|_| {
-            let t = Instant::now();
-            f();
-            ms(t)
-        })
-        .collect();
-    samples.sort_by(f64::total_cmp);
-    let at = |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize];
-    (at(0.5), at(0.95))
+/// Either engine, reduced to "selected backend" and "image to text".
+#[allow(clippy::large_enum_variant)] // one per process
+enum Engine {
+    Pp(PpOcr),
+    Meiki(meikiocr::MeikiOcr),
+}
+impl Engine {
+    fn selected(&self) -> String {
+        match self {
+            Engine::Pp(e) => format!("{:?}", e.backend_info().selected),
+            Engine::Meiki(e) => format!("{:?}", e.backend_info().selected),
+        }
+    }
+    fn fallbacks(&self) -> Vec<String> {
+        match self {
+            Engine::Pp(e) => e.backend_info().fallback_reasons.clone(),
+            Engine::Meiki(e) => e.backend_info().fallback_reasons.clone(),
+        }
+    }
+    fn ocr(&mut self, image: &image::RgbImage) -> String {
+        match self {
+            Engine::Pp(e) => {
+                let mut lines = e.ocr(image, OcrOptions::default()).unwrap();
+                ppocr::japanese::fix_lines(&mut lines);
+                lines.into_iter().map(|l| l.text).collect::<Vec<_>>().join("\n")
+            }
+            Engine::Meiki(e) => e
+                .ocr(image, meikiocr::OcrOptions::default())
+                .unwrap()
+                .into_iter()
+                .map(|l| l.text)
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
 /// Whitespace removed and full-width ASCII folded, as a dictionary lookup treats them alike.
@@ -58,8 +87,8 @@ fn normalise(s: &str) -> Vec<char> {
         })
         .collect()
 }
-
-fn distance(a: &[char], b: &[char]) -> usize {
+fn cer(truth: &str, got: &str) -> f64 {
+    let (a, b) = (normalise(truth), normalise(got));
     let mut row: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.iter().enumerate() {
         let mut prev = row[0];
@@ -70,14 +99,14 @@ fn distance(a: &[char], b: &[char]) -> usize {
             row[j + 1] = next;
         }
     }
-    row[b.len()]
+    row[b.len()] as f64 / a.len().max(1) as f64
 }
-
-fn truth(image: &str) -> Option<String> {
-    let path = std::path::Path::new(image).with_extension("truth.json");
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+fn truth(path: &str) -> Option<String> {
+    let stem = path.strip_suffix(".png").unwrap_or(path);
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stem}.truth.json")).ok()?).ok()?;
     Some(
-        v["lines"]
+        json["lines"]
             .as_array()?
             .iter()
             .filter_map(|l| l["text"].as_str())
@@ -85,21 +114,22 @@ fn truth(image: &str) -> Option<String> {
             .join("\n"),
     )
 }
+/// Nearest-rank percentile of sorted samples.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
 
-/// Peak resident set size of this process, in MiB.
+/// The process's peak resident set in MiB.
 #[cfg(unix)]
 fn peak_rss_mib() -> Option<f64> {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
         return None;
     }
-    // ru_maxrss is bytes on macOS and KiB on Linux.
-    let bytes = if cfg!(target_os = "macos") {
-        usage.ru_maxrss as f64
-    } else {
-        usage.ru_maxrss as f64 * 1024.0
-    };
-    Some(bytes / (1024.0 * 1024.0))
+    // ru_maxrss is bytes on macOS, KiB elsewhere.
+    let bytes = if cfg!(target_os = "macos") { 1.0 } else { 1024.0 };
+    Some(usage.ru_maxrss as f64 * bytes / (1024.0 * 1024.0))
 }
 #[cfg(not(unix))]
 fn peak_rss_mib() -> Option<f64> {
@@ -107,120 +137,138 @@ fn peak_rss_mib() -> Option<f64> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [dir, backend_name, runs, images @ ..] = args.as_slice() else {
-        return Err("usage: bench MODEL_DIR BACKEND RUNS IMAGE...".into());
-    };
-    let runs: usize = runs.parse()?;
-    let tier = match std::env::var("PPOCR_TIER").as_deref() {
-        Ok("medium") => Tier::Medium,
-        Ok("tiny") => Tier::Tiny,
-        _ => Tier::Small,
-    };
-    let config = Config {
-        backend: backend(backend_name)?,
-        detection_max_side: env("PPOCR_MAX_SIDE").unwrap_or(960),
-        max_batch_size: env("PPOCR_BATCH").unwrap_or(8),
-        intra_threads: env("PPOCR_THREADS"),
-        device_id: env("PPOCR_DEVICE"),
-        cache_dir: std::env::var_os("PPOCR_CACHE").map(Into::into),
-    };
-    let label = std::env::var("BENCH_LABEL").unwrap_or_else(|_| backend_name.clone());
-    let decoded: Vec<_> = images
+    let start = Instant::now();
+    let (mut engine_name, mut models, mut tier, mut backend_name) =
+        ("ppocr".to_string(), "models".to_string(), "small".to_string(), "auto".to_string());
+    let (mut threads, mut runs, mut json_only) = (None::<usize>, 20usize, false);
+    let mut cache = None::<std::path::PathBuf>;
+    let mut images = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--engine" => engine_name = value()?,
+            "--models" => models = value()?,
+            "--tier" => tier = value()?,
+            "--backend" => backend_name = value()?,
+            "--threads" => threads = Some(value()?.parse()?),
+            "--cache" => cache = Some(value()?.into()),
+            "--runs" => runs = value()?.parse()?,
+            "--json" => json_only = true,
+            _ if arg.starts_with("--") => return Err(format!("unknown option {arg}").into()),
+            _ => images.push(arg),
+        }
+    }
+    if images.is_empty() || runs == 0 {
+        return Err("usage: bench [--engine ppocr|meiki] [--models DIR] [--tier T] [--backend B] \
+                    [--threads N] [--cache DIR] [--runs N] [--json] IMAGE..."
+            .into());
+    }
+    let backend = backend(&backend_name)?;
+    let decode = Instant::now();
+    let decoded: Vec<(String, image::RgbImage)> = images
         .iter()
-        .map(|p| Ok::<_, image::ImageError>((p.as_str(), image::open(p)?.to_rgb8())))
+        .map(|p| Ok::<_, image::ImageError>((p.clone(), image::open(p)?.to_rgb8())))
         .collect::<Result<_, _>>()?;
+    let decode_ms = decode.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();
-    let mut ocr = PpOcr::with_config(ModelPaths::from_dir(dir, tier), config.clone())?;
-    let load = ms(t);
-    let info = ocr.backend_info().clone();
-    println!(
-        "{label}: {} tier, {:?} selected, load {load:.0} ms, max side {}, batch {}",
-        tier.name(),
-        info.selected,
-        config.detection_max_side,
-        config.max_batch_size
-    );
-    for reason in &info.fallback_reasons {
-        println!("  fallback: {reason}");
-    }
-
-    let options = OcrOptions::default();
-    let read = |ocr: &mut PpOcr, image| {
-        let mut lines = ocr.ocr(image, options).unwrap();
-        ppocr::japanese::fix_lines(&mut lines);
-        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+    let mut engine = match engine_name.as_str() {
+        "ppocr" => Engine::Pp(PpOcr::with_config(
+            ModelPaths::from_dir(&models, match tier.as_str() {
+                "medium" => Tier::Medium,
+                "tiny" => Tier::Tiny,
+                _ => Tier::Small,
+            }),
+            Config { backend, intra_threads: threads, cache_dir: cache, ..Default::default() },
+        )?),
+        "meiki" => Engine::Meiki(meikiocr::MeikiOcr::with_config(
+            meikiocr::ModelPaths::from_dir(&models),
+            meikiocr::Config {
+                backend: meiki_backend(backend),
+                intra_threads: threads,
+                ..Default::default()
+            },
+        )?),
+        other => return Err(format!("unknown engine {other}").into()),
     };
-    let mut first_total = 0.0;
-    let mut cold_first = Vec::new();
-    for (_, image) in &decoded {
-        let t = Instant::now();
-        let _ = ocr.ocr(image, options)?;
-        cold_first.push(ms(t));
-        first_total += ms(t);
+    let load_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = Instant::now();
+    let first_text = engine.ocr(&decoded[0].1);
+    let first_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let cold_ms = start.elapsed().as_secs_f64() * 1000.0 - decode_ms;
+
+    let mut all = Vec::new();
+    let mut per_image = Vec::new();
+    let mut cers = Vec::new();
+    for (i, (path, image)) in decoded.iter().enumerate() {
+        // Each image's first pass is its accuracy sample and its warm-up (new shapes).
+        let text = if i == 0 { first_text.clone() } else { engine.ocr(image) };
+        let mut ms: Vec<f64> = (0..runs)
+            .map(|_| {
+                let t = Instant::now();
+                engine.ocr(image);
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        all.extend_from_slice(&ms);
+        ms.sort_by(f64::total_cmp);
+        let error = truth(path).map(|t| cer(&t, &text));
+        cers.extend(error);
+        let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+        per_image.push(serde_json::json!({
+            "image": name, "width": image.width(), "height": image.height(),
+            "p50_ms": percentile(&ms, 50.0), "p95_ms": percentile(&ms, 95.0), "cer": error,
+        }));
     }
-    println!(
-        "{:>10} {:>9} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}",
-        "image", "size", "lines", "first", "det p50", "det p95", "p50", "p95", "CER"
-    );
-    let (mut p50_sum, mut p95_sum, mut cer_sum, mut cer_n) = (0.0, 0.0, 0.0, 0);
-    for ((path, image), first) in decoded.iter().zip(&cold_first) {
-        let text = read(&mut ocr, image);
-        let (dp50, dp95) = percentiles(runs, || {
-            ocr.detect(image, options).unwrap();
-        });
-        let (p50, p95) = percentiles(runs, || {
-            ocr.ocr(image, options).unwrap();
-        });
-        p50_sum += p50;
-        p95_sum += p95;
-        let cer = truth(path).map(|t| {
-            let (t, g) = (normalise(&t), normalise(&text));
-            distance(&t, &g) as f64 / t.len().max(1) as f64 * 100.0
-        });
-        if let Some(c) = cer {
-            cer_sum += c;
-            cer_n += 1;
-        }
-        let name = std::path::Path::new(path).file_stem().unwrap_or_default().to_string_lossy();
+    all.sort_by(f64::total_cmp);
+    let mean_cer = (!cers.is_empty()).then(|| cers.iter().sum::<f64>() / cers.len() as f64);
+    let peak = peak_rss_mib();
+    let summary = serde_json::json!({
+        "engine": engine_name,
+        "tier": (engine_name == "ppocr").then_some(&tier),
+        "requested": backend_name,
+        "selected": engine.selected(),
+        "fallbacks": engine.fallbacks(),
+        "threads": threads,
+        "runs": runs,
+        "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+        "load_ms": load_ms, "first_ms": first_ms, "cold_ms": cold_ms,
+        "warm_p50_ms": percentile(&all, 50.0), "warm_p95_ms": percentile(&all, 95.0),
+        "warm_mean_ms": all.iter().sum::<f64>() / all.len() as f64,
+        "peak_rss_mib": peak,
+        "mean_cer": mean_cer,
+        "images": per_image,
+    });
+    if !json_only {
         println!(
-            "{name:>10} {:>9} {:>5} {first:8.1} {dp50:8.1} {dp95:8.1} {p50:8.1} {p95:8.1} {:>6}",
-            format!("{}x{}", image.width(), image.height()),
-            text.lines().count(),
-            cer.map_or("-".into(), |c| format!("{c:.1}%")),
+            "{engine_name} {} (requested {backend_name}, threads {})",
+            engine.selected(),
+            threads.map_or("default".into(), |n| n.to_string())
         );
-        if std::env::var_os("BENCH_VERBOSE").is_some() {
-            println!("            {}", text.replace('\n', " | "));
+        for reason in engine.fallbacks() {
+            println!("  fallback: {reason}");
         }
+        println!("cold {cold_ms:.0} ms (load {load_ms:.0} + first image {first_ms:.0})");
+        for row in &per_image {
+            println!(
+                "{:>10} {:>4}x{:<4} p50 {:7.1} ms  p95 {:7.1} ms  CER {}",
+                row["image"].as_str().unwrap(),
+                row["width"],
+                row["height"],
+                row["p50_ms"].as_f64().unwrap(),
+                row["p95_ms"].as_f64().unwrap(),
+                row["cer"].as_f64().map_or("-".into(), |c| format!("{:.1}%", c * 100.0)),
+            );
+        }
+        println!(
+            "warm p50 {:.1} ms  p95 {:.1} ms  | peak RSS {}  | mean CER {}",
+            percentile(&all, 50.0),
+            percentile(&all, 95.0),
+            peak.map_or("n/a".into(), |m| format!("{m:.0} MiB")),
+            mean_cer.map_or("-".into(), |c| format!("{:.1}%", c * 100.0)),
+        );
     }
-    let n = decoded.len().max(1) as f64;
-    let rss = peak_rss_mib();
-    let cer_mean = (cer_n > 0).then(|| cer_sum / cer_n as f64);
-    println!(
-        "{label}: load {load:.0} ms, first calls {first_total:.0} ms, warm mean p50 {:.1} ms p95 {:.1} ms, CER {}, peak RSS {}",
-        p50_sum / n,
-        p95_sum / n,
-        cer_mean.map_or("-".into(), |c| format!("{c:.2}%")),
-        rss.map_or("-".into(), |r| format!("{r:.0} MiB")),
-    );
-    println!(
-        "BENCH {}",
-        serde_json::json!({
-            "label": label,
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-            "tier": tier.name(),
-            "selected": format!("{:?}", info.selected),
-            "load_ms": load.round(),
-            "first_calls_ms": first_total.round(),
-            "warm_p50_ms": (p50_sum / n * 10.0).round() / 10.0,
-            "warm_p95_ms": (p95_sum / n * 10.0).round() / 10.0,
-            "cer_percent": cer_mean.map(|c| (c * 100.0).round() / 100.0),
-            "peak_rss_mib": rss.map(f64::round),
-            "images": decoded.len(),
-            "runs": runs,
-        })
-    );
+    println!("BENCH {summary}");
     Ok(())
 }

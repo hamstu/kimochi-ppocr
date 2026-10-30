@@ -32,12 +32,13 @@ Core ML compiles each of those shapes on first use, seconds per recognizer width
 
 On an RTX 3080 Ti (DirectML), the small tier reads a frame of game text in about 22 ms, against MeikiOCR's 85–107 ms. On CPU it is slower than MeikiOCR (about 110–130 ms against 70–80 ms). On an Apple M5 Max (Core ML on the GPU) it reads one in about 10 ms against MeikiOCR's 42 ms; loading takes 6.4 s the first time and 1.7 s from the cache.
 
-`examples/bench.rs` is the benchmark to compare machines and configurations with: load time, the first call per image, warm p50/p95, character error rate against Kimochi's overlay-alignment fixtures, and peak memory, with a JSON summary line.
+`examples/bench.rs` is the cross-machine benchmark: cold start, warm p50/p95, peak memory and character error rate on Kimochi's overlay-alignment fixtures, for PP-OCR or MeikiOCR, ending in one `BENCH {json}` line. Run one process per configuration.
 
 ```sh
 cargo test
 cargo run --release --example ocr -- models screenshot.png auto small
-PPOCR_CACHE=/tmp/ppocr-coreml cargo run --release --example bench -- models auto 30 fixtures/*.png
+cargo run --release --example bench -- --models models --backend cpu --threads 6 ../kimochi/scripts/fixtures/overlay-alignment/*.png
+cargo run --release --example bench -- --models models --backend coreml --cache /tmp/ppocr-coreml ../kimochi/scripts/fixtures/overlay-alignment/*.png
 ```
 
 ## Licence
