@@ -1,0 +1,11 @@
+/target/
+/models/
+/.venv/
+*.dylib
+*.dll
+*.so*
+.DS_Store
+.env
+.env.*
+*.pem
+*.key

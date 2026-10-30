@@ -1,0 +1,9 @@
+ppocr (Rust)
+
+Native inference for PaddleOCR's PP-OCRv6 detection and recognition models
+(https://github.com/PaddlePaddle/PaddleOCR), Apache-2.0, by PaddlePaddle.
+The preprocessing and postprocessing (DetResizeForTest, DBPostProcess,
+RecResizeImg, CTCLabelDecode) follow PaddleOCR/PaddleX's reference behaviour.
+
+Model weights are not part of this repository. They are distributed
+separately by PaddlePaddle on Hugging Face under Apache-2.0.

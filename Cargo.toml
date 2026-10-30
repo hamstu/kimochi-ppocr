@@ -1,0 +1,24 @@
+[package]
+name = "ppocr"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "PP-OCRv6 text detection and recognition with ONNX Runtime hardware acceleration"
+
+[features]
+default = ["coreml", "cuda", "directml"]
+coreml = ["ort/coreml"]
+cuda = ["ort/cuda"]
+directml = ["ort/directml"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+ndarray = "0.16"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
+# Side-by-side comparison in examples/compare.rs only.
+meikiocr = { git = "https://github.com/hamstu/kimochi-meikiocr", rev = "7a1b9a762acbdf6b09d7386b4395c366f135733b" }
