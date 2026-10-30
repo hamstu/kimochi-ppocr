@@ -94,9 +94,20 @@ const CACHE_ENTRIES: usize = 24;
 
 /// Mark a cache entry as used, for `prune_cache`'s ordering. Errors only cost that ordering.
 fn touch(dir: &Path, key: &str) {
-    if let Ok(entry) = std::fs::File::open(dir.join(key)) {
-        let _ = entry.set_modified(std::time::SystemTime::now());
+    let _ = set_modified(&dir.join(key), std::time::SystemTime::now());
+}
+
+/// Set a cache entry's (a directory's) modification time. Windows opens a directory only with
+/// FILE_FLAG_BACKUP_SEMANTICS, and needs write access to change its times; Unix needs neither.
+fn set_modified(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.write(true).custom_flags(0x0200_0000);
     }
+    options.open(path)?.set_modified(time)
 }
 
 /// Delete this crate's entries that belong to other model files or an older key scheme, then the
@@ -478,7 +489,7 @@ mod tests {
             let key = cache_key(1, &[1, 3, 32, 32 * (i + 1)]);
             std::fs::create_dir(dir.join(&key)).unwrap();
             if i < 2 {
-                std::fs::File::open(dir.join(&key)).unwrap().set_modified(old).unwrap();
+                set_modified(&dir.join(&key), old).unwrap();
             }
             current.push(key);
         }
