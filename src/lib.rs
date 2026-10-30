@@ -79,6 +79,9 @@ pub struct Config {
     pub detection_max_side: u32,
     /// DirectML/CUDA adapter index; None uses the provider's default (DXGI adapter 0).
     pub device_id: Option<i32>,
+    /// Where Core ML keeps compiled models, one per model and input shape, so later loads skip
+    /// compilation (seconds per shape). None compiles on every load. Other backends ignore it.
+    pub cache_dir: Option<PathBuf>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -88,6 +91,7 @@ impl Default for Config {
             intra_threads: None,
             detection_max_side: 960,
             device_id: None,
+            cache_dir: None,
         }
     }
 }

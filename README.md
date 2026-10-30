@@ -28,11 +28,16 @@ Models are not included. PaddlePaddle publishes each tier (`medium`, `small` or 
 
 At load, the recognizer graph is rewritten in memory to end in `ArgMax` and `ReduceMax` over the class axis, so each run returns one class and score per time step instead of 18,710 probabilities. Downloaded files are not changed. On DirectML and Core ML, every input shape gets its own pinned session: ONNX Runtime 1.22's DirectML path runs a dynamic session's first shape at full speed, then 3–4× slower once it has seen a second shape.
 
-On an RTX 3080 Ti (DirectML), the small tier reads a frame of game text in about 22 ms, against MeikiOCR's 85–107 ms. On CPU it is slower than MeikiOCR (about 110–130 ms against 70–80 ms).
+Core ML compiles each of those shapes on first use, seconds per recognizer width. Set `Config::cache_dir` to a directory the crate can own and the compiled models are kept there, keyed by model content and input shape, so later loads skip compilation; the least recently built beyond 24 entries, and entries for other model files, are deleted at load.
+
+On an RTX 3080 Ti (DirectML), the small tier reads a frame of game text in about 22 ms, against MeikiOCR's 85–107 ms. On CPU it is slower than MeikiOCR (about 110–130 ms against 70–80 ms). On an Apple M5 Max (Core ML on the GPU) it reads one in about 10 ms against MeikiOCR's 42 ms; loading takes 6.4 s the first time and 1.7 s from the cache.
+
+`examples/bench.rs` is the benchmark to compare machines and configurations with: load time, the first call per image, warm p50/p95, character error rate against Kimochi's overlay-alignment fixtures, and peak memory, with a JSON summary line.
 
 ```sh
 cargo test
 cargo run --release --example ocr -- models screenshot.png auto small
+PPOCR_CACHE=/tmp/ppocr-coreml cargo run --release --example bench -- models auto 30 fixtures/*.png
 ```
 
 ## Licence

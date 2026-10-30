@@ -214,6 +214,22 @@ pub(crate) fn compact_recognizer(bytes: &[u8]) -> Result<(Vec<u8>, Option<i64>)>
     Ok((out, classes))
 }
 
+/// The model with one more `metadata_props` entry (`ModelProto` field 14).
+pub(crate) fn with_metadata(bytes: &[u8], key: &str, value: &str) -> Vec<u8> {
+    let mut entry = Vec::new();
+    put_bytes(&mut entry, 1, key.as_bytes());
+    put_bytes(&mut entry, 2, value.as_bytes());
+    let mut out = Vec::with_capacity(bytes.len() + entry.len() + 8);
+    out.extend_from_slice(bytes);
+    put_bytes(&mut out, 14, &entry);
+    out
+}
+
+/// FNV-1a: a stable content hash for cache keys (std's hashers may change between releases).
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +244,15 @@ mod tests {
         assert_eq!(varint(f[0].value, &mut o).unwrap(), 300);
         assert_eq!(f[0].encoded.len() + f[1].encoded.len(), buf.len());
         assert!(fields(&[0x0a, 0x05, 1]).is_err()); // truncated payload
+    }
+    #[test]
+    fn metadata_is_appended_as_a_key_value_entry() {
+        let mut model = Vec::new();
+        put_int(&mut model, 1, 8); // ir_version
+        let out = with_metadata(&model, "CACHE_KEY", "abc1");
+        let f = fields(&out).unwrap();
+        assert_eq!((f.len(), f[1].number), (2, 14));
+        let entry = fields(f[1].value).unwrap();
+        assert_eq!((entry[0].value, entry[1].value), (&b"CACHE_KEY"[..], &b"abc1"[..]));
     }
 }

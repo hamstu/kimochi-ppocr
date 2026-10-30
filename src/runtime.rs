@@ -1,4 +1,5 @@
 use crate::{Config, Error, ModelPaths, Result};
+use std::path::Path;
 use ndarray::Array4;
 use ort::{
     execution_providers::ExecutionProviderDispatch,
@@ -23,18 +24,25 @@ pub struct BackendInfo {
     pub selected: Backend,
     pub fallback_reasons: Vec<String>,
 }
-fn provider(backend: Backend, device: Option<i32>) -> Result<Option<ExecutionProviderDispatch>> {
-    let _ = device; // only CUDA and DirectML take a device
+fn provider(backend: Backend, config: &Config) -> Result<Option<ExecutionProviderDispatch>> {
+    let device = config.device_id; // only CUDA and DirectML take a device
     match backend {
         Backend::Cpu => Ok(None),
         #[cfg(feature = "coreml")]
         Backend::CoreMl => Ok(Some(
-            ort::execution_providers::CoreMLExecutionProvider::default()
-                .with_static_input_shapes(true)
-                .with_model_format(ort::execution_providers::coreml::CoreMLModelFormat::MLProgram)
-                .with_compute_units(ort::execution_providers::coreml::CoreMLComputeUnits::All)
-                .build()
-                .error_on_failure(),
+            {
+                let mut ep = ort::execution_providers::CoreMLExecutionProvider::default()
+                    .with_static_input_shapes(true)
+                    .with_model_format(ort::execution_providers::coreml::CoreMLModelFormat::MLProgram)
+                    // GPU rather than `All`: the same speed (Apple M5 Max: the warm pipeline runs on
+                    // the GPU either way; the Neural Engine alone is 5× slower), without the Neural
+                    // Engine compile, which is a quarter of a cold load.
+                    .with_compute_units(ort::execution_providers::coreml::CoreMLComputeUnits::CPUAndGPU);
+                if let Some(dir) = &config.cache_dir {
+                    ep = ep.with_model_cache_dir(dir.display());
+                }
+                ep.build().error_on_failure()
+            },
         )),
         #[cfg(feature = "cuda")]
         Backend::Cuda => Ok(Some(
@@ -66,6 +74,63 @@ fn per_shape(backend: Backend) -> bool {
     matches!(backend, Backend::DirectMl | Backend::CoreMl)
 }
 
+/// Core ML's compiled-model cache is keyed by the model's `COREML_CACHE_KEY` metadata, else by a
+/// hash of its input and node names (ONNX Runtime's `coreml_execution_provider.cc`), which is the
+/// same for every input shape: without a key, a session pinned to one shape would load a model
+/// compiled for another. The key is alphanumeric and at most 64 characters, as ONNX Runtime requires; the
+/// leading version letter retires every entry when this scheme or the rewrite changes.
+fn cache_key(content_hash: u64, shape: &[usize]) -> String {
+    let dims: Vec<String> = shape.iter().map(usize::to_string).collect();
+    format!("{}{}", cache_prefix(content_hash), dims.join("x"))
+}
+fn cache_prefix(content_hash: u64) -> String {
+    format!("a{content_hash:016x}s")
+}
+
+/// Compiled models kept in the cache, most recently built first. Each is one model at one input
+/// shape (detector 19 MB, recognizer 68 MB): the recognizer's few widths and the detector's
+/// recent capture sizes.
+const CACHE_ENTRIES: usize = 24;
+
+/// Mark a cache entry as used, for `prune_cache`'s ordering. Errors only cost that ordering.
+fn touch(dir: &Path, key: &str) {
+    if let Ok(entry) = std::fs::File::open(dir.join(key)) {
+        let _ = entry.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Delete this crate's entries that belong to other model files or an older key scheme, then the
+/// least recently built beyond `CACHE_ENTRIES`. Other names in the directory are left alone.
+fn prune_cache(dir: &Path, current: &[u64]) {
+    let Ok(listing) = std::fs::read_dir(dir) else { return };
+    let ours = |name: &str| {
+        let b = name.as_bytes();
+        b.len() > 18
+            && b[0].is_ascii_lowercase()
+            && b[1..17].iter().all(|c| c.is_ascii_hexdigit())
+            && b[17] == b's'
+            && b[18..].iter().all(|c| c.is_ascii_digit() || *c == b'x')
+    };
+    let prefixes: Vec<String> = current.iter().map(|&h| cache_prefix(h)).collect();
+    let mut kept = Vec::new();
+    for entry in listing.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !ours(&name) {
+            continue;
+        }
+        if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+            let used = entry.metadata().and_then(|m| m.modified()).ok();
+            kept.push((used, entry.path()));
+        } else {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    kept.sort_by_key(|k| std::cmp::Reverse(k.0));
+    for (_, path) in kept.into_iter().skip(CACHE_ENTRIES) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
 /// One model file and the sessions that run it.
 pub(crate) struct Model {
     bytes: Vec<u8>,
@@ -80,6 +145,8 @@ pub(crate) struct Model {
     /// class count its original output declared.
     pub compact: bool,
     pub declared_classes: Option<i64>,
+    /// The model's content hash, when Core ML caches its compiled models (`cache_key`).
+    content_hash: Option<u64>,
 }
 impl Model {
     fn build(&self, shape: Option<&[usize]>) -> Result<Session> {
@@ -102,10 +169,28 @@ impl Model {
                 }
             }
         }
-        if let Some(ep) = provider(self.backend, self.config.device_id)? {
+        if let Some(ep) = provider(self.backend, &self.config)? {
             builder = builder.with_execution_providers([ep])?;
         }
-        Ok(builder.commit_from_memory(&self.bytes)?)
+        match (self.content_hash, shape) {
+            (Some(hash), Some(shape)) => {
+                let key = cache_key(hash, shape);
+                let keyed = crate::onnx::with_metadata(&self.bytes, "COREML_CACHE_KEY", &key);
+                let session = builder.commit_from_memory(&keyed)?;
+                if let Some(dir) = &self.config.cache_dir {
+                    touch(dir, &key);
+                }
+                Ok(session)
+            }
+            _ => Ok(builder.commit_from_memory(&self.bytes)?),
+        }
+    }
+    /// A session that only describes the model's input, built without a provider or graph
+    /// optimisation (a Core ML session would compile the whole graph first).
+    fn describe(&self) -> Result<Session> {
+        Ok(Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Disable)?
+            .commit_from_memory(&self.bytes)?)
     }
     fn open(bytes: Vec<u8>, backend: Backend, config: &Config, capacity: usize) -> Result<Self> {
         let mut model = Self {
@@ -117,9 +202,17 @@ impl Model {
             capacity: if per_shape(backend) { capacity } else { 1 },
             compact: false,
             declared_classes: None,
+            content_hash: None,
         };
+        if backend == Backend::CoreMl
+            && let Some(dir) = &config.cache_dir
+        {
+            // ONNX Runtime creates only the last directory level.
+            let _ = std::fs::create_dir_all(dir);
+            model.content_hash = Some(crate::onnx::fnv1a(&model.bytes));
+        }
         // The dynamic session supplies the dimension names; per-shape backends then drop it.
-        let session = model.build(None)?;
+        let session = if per_shape(backend) { model.describe()? } else { model.build(None)? };
         let ValueType::Tensor { dimension_symbols, shape, .. } = &session.inputs[0].input_type else {
             return Err(Error::ModelContract("model input is not a tensor".into()));
         };
@@ -255,6 +348,9 @@ pub(crate) fn load(models: &ModelPaths, config: &Config) -> Result<(Model, Model
         })();
         match attempt {
             Ok((det, rec)) => {
+                if let (Some(dir), Some(d), Some(r)) = (&config.cache_dir, det.content_hash, rec.content_hash) {
+                    prune_cache(dir, &[d, r]);
+                }
                 return Ok((
                     det,
                     rec,
@@ -274,4 +370,41 @@ pub(crate) fn load(models: &ModelPaths, config: &Config) -> Result<(Model, Model
         }
     }
     unreachable!("CPU is always a candidate")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_keys_differ_by_shape_and_satisfy_onnx_runtime() {
+        let a = cache_key(0xdead_beef, &[1, 3, 48, 320]);
+        let b = cache_key(0xdead_beef, &[1, 3, 48, 640]);
+        assert_ne!(a, b);
+        assert!(a.len() <= 64 && a.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+    #[test]
+    fn pruning_drops_stale_models_and_the_oldest_entries_only() {
+        let dir = std::env::temp_dir().join(format!("ppocr-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let mut current = Vec::new();
+        for i in 0..CACHE_ENTRIES + 2 {
+            let key = cache_key(1, &[1, 3, 32, 32 * (i + 1)]);
+            std::fs::create_dir(dir.join(&key)).unwrap();
+            if i < 2 {
+                std::fs::File::open(dir.join(&key)).unwrap().set_modified(old).unwrap();
+            }
+            current.push(key);
+        }
+        let stale = cache_key(2, &[1, 3, 48, 320]);
+        std::fs::create_dir(dir.join(&stale)).unwrap();
+        std::fs::create_dir(dir.join("not-ours")).unwrap();
+        prune_cache(&dir, &[1]);
+        let exists = |k: &str| dir.join(k).exists();
+        assert!(!exists(&stale) && exists("not-ours"));
+        assert!(!exists(&current[0]) && !exists(&current[1]));
+        assert!(current[2..].iter().all(|k| exists(k)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
