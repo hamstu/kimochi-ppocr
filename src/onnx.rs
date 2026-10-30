@@ -159,6 +159,51 @@ fn last_dim(value_info: &[u8]) -> Result<Option<i64>> {
     }
 }
 
+/// The first graph input's dimension symbols, by axis ("" for fixed axes), read from the file
+/// so that backends which pin every shape need not build a throwaway dynamic session (on
+/// DirectML that costs about 300 ms per model). Initializers listed as inputs are skipped.
+pub(crate) fn input_symbols(bytes: &[u8]) -> Result<Vec<String>> {
+    let model = fields(bytes)?;
+    let graph_field = model.iter().find(|f| f.number == 7).ok_or_else(invalid)?;
+    let graph = fields(graph_field.value)?;
+    // TensorProto.name is field 8 (field 1 is `dims`).
+    let initializers: Vec<&str> = graph
+        .iter()
+        .filter(|f| f.number == 5)
+        .filter_map(|f| {
+            let name = fields(f.value).ok()?.into_iter().find(|f| f.number == 8)?;
+            string(name.value).ok()
+        })
+        .collect();
+    for input in graph.iter().filter(|f| f.number == 11) {
+        let info = fields(input.value)?;
+        let name = info.iter().find(|f| f.number == 1).map(|f| string(f.value)).transpose()?.unwrap_or("");
+        if initializers.contains(&name) {
+            continue;
+        }
+        let get = |bytes, n| -> Result<Option<&[u8]>> {
+            Ok(fields(bytes)?.into_iter().find(|f| f.number == n).map(|f| f.value))
+        };
+        let Some(ty) = info.iter().find(|f| f.number == 2).map(|f| f.value) else { continue };
+        let Some(tensor) = get(ty, 1)? else { continue };
+        let Some(shape) = get(tensor, 2)? else {
+            return Err(Error::ModelContract("model input has no shape".into()));
+        };
+        return fields(shape)?
+            .into_iter()
+            .filter(|f| f.number == 1)
+            .map(|dim| {
+                let dim = fields(dim.value)?;
+                match dim.iter().find(|f| f.number == 2) {
+                    Some(param) => Ok(string(param.value)?.to_string()),
+                    None => Ok(String::new()),
+                }
+            })
+            .collect();
+    }
+    Err(Error::ModelContract("model has no input".into()))
+}
+
 pub(crate) const CLASSES: &str = "ppocr_best_class";
 pub(crate) const SCORES: &str = "ppocr_best_score";
 
@@ -254,5 +299,45 @@ mod tests {
         assert_eq!((f.len(), f[1].number), (2, 14));
         let entry = fields(f[1].value).unwrap();
         assert_eq!((entry[0].value, entry[1].value), (&b"CACHE_KEY"[..], &b"abc1"[..]));
+    }
+    #[test]
+    fn input_symbols_skip_initializers_and_name_dynamic_axes() {
+        // graph { initializer { name: "w" }, input { name: "w" }, input { name: "x", type {
+        //   tensor_type { shape { dim { dim_param: "N" } dim { dim_value: 3 } } } } } }
+        let mut dims = Vec::new();
+        let mut n = Vec::new();
+        put_bytes(&mut n, 2, b"N");
+        put_bytes(&mut dims, 1, &n);
+        let mut three = Vec::new();
+        put_int(&mut three, 1, 3);
+        put_bytes(&mut dims, 1, &three);
+        let mut tensor = Vec::new();
+        put_bytes(&mut tensor, 2, &dims);
+        let mut ty = Vec::new();
+        put_bytes(&mut ty, 1, &tensor);
+        let mut x = Vec::new();
+        put_bytes(&mut x, 1, b"x");
+        put_bytes(&mut x, 2, &ty);
+        let mut w = Vec::new(); // TensorProto: name is field 8
+        put_bytes(&mut w, 8, b"w");
+        let mut w_input = Vec::new(); // ValueInfoProto: name is field 1
+        put_bytes(&mut w_input, 1, b"w");
+        let mut graph = Vec::new();
+        put_bytes(&mut graph, 5, &w);
+        put_bytes(&mut graph, 11, &w_input);
+        put_bytes(&mut graph, 11, &x);
+        let mut model = Vec::new();
+        put_bytes(&mut model, 7, &graph);
+        assert_eq!(input_symbols(&model).unwrap(), ["N", ""]);
+    }
+    #[test]
+    fn input_symbols_of_the_published_models_match_their_sessions() {
+        // Runs only beside downloaded models (`models/`); their exports name every dynamic axis.
+        for name in ["PP-OCRv6_small_det.onnx", "PP-OCRv6_small_rec.onnx"] {
+            let Ok(bytes) = std::fs::read(format!("models/{name}")) else { continue };
+            let symbols = input_symbols(&bytes).unwrap();
+            assert_eq!(symbols.len(), 4, "{name}: {symbols:?}");
+            assert!(symbols[1].is_empty() && symbols.iter().filter(|s| !s.is_empty()).count() >= 2, "{name}: {symbols:?}");
+        }
     }
 }
