@@ -172,6 +172,26 @@ pub(crate) fn detect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `cargo test --release -- --ignored --nocapture postprocess_cost`: DB post-processing of
+    /// a 960x544 map holding a few text kernels, in milliseconds.
+    #[test]
+    #[ignore]
+    fn postprocess_cost() {
+        let (w, h) = (960, 544);
+        let mut pred = vec![0.01f32; w * h];
+        for (top, left, right) in [(100, 50, 700), (200, 50, 900), (300, 100, 400), (400, 50, 800)] {
+            for y in top..top + 30 {
+                for x in left..right {
+                    pred[y * w + x] = 0.9;
+                }
+            }
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            assert_eq!(boxes(&pred, w, h, OcrOptions::default()).len(), 4);
+        }
+        println!("det post-process 960x544: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
+    }
     #[test]
     fn input_keeps_small_images_and_limits_large_ones_to_multiples_of_32() {
         assert_eq!(input_size(1920, 1080, 960), (960, 544));

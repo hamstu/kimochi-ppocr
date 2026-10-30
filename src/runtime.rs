@@ -1,7 +1,7 @@
 use crate::{Config, Error, ModelPaths, Result};
 use ndarray::Array4;
 use ort::{
-    execution_providers::ExecutionProviderDispatch,
+    execution_providers::{ExecutionProvider, ExecutionProviderDispatch},
     session::{Session, SessionOutputs, builder::GraphOptimizationLevel},
     value::{Tensor, ValueType},
 };
@@ -81,31 +81,84 @@ pub(crate) struct Model {
     pub compact: bool,
     pub declared_classes: Option<i64>,
 }
-impl Model {
-    fn build(&self, shape: Option<&[usize]>) -> Result<Session> {
-        let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_op_spinning(false)?
-            .with_config_entry("session.inter_op.allow_spinning", "0")?;
-        if let Some(n) = self.config.intra_threads {
-            builder = builder.with_intra_threads(n)?;
-        }
-        if self.backend == Backend::DirectMl {
-            builder = builder
-                .with_parallel_execution(false)?
-                .with_memory_pattern(false)?;
-        }
-        if let Some(shape) = shape {
-            for (symbol, &size) in self.symbols.iter().zip(shape) {
-                if !symbol.is_empty() {
-                    builder = builder.with_dimension_override(symbol, size as i64)?;
-                }
+/// Whether sessions built ahead of use may be built concurrently, one thread each.
+///
+/// DirectML session creation is mostly shader compilation on the CPU: on a GTX 1080 the three
+/// warm-up recognizer sessions took 1.0–2.4 s one after another and 0.7 s together. Core ML is
+/// untested and stays sequential.
+fn parallel_build(backend: Backend) -> bool {
+    backend == Backend::DirectMl
+}
+
+fn build_session(
+    bytes: &[u8],
+    backend: Backend,
+    config: &Config,
+    symbols: &[String],
+    shape: Option<&[usize]>,
+) -> Result<Session> {
+    let mut builder = Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_intra_op_spinning(false)?
+        .with_config_entry("session.inter_op.allow_spinning", "0")?;
+    if let Some(n) = config.intra_threads {
+        builder = builder.with_intra_threads(n)?;
+    }
+    if backend == Backend::DirectMl {
+        builder = builder
+            .with_parallel_execution(false)?
+            .with_memory_pattern(false)?;
+    }
+    if let Some(shape) = shape {
+        for (symbol, &size) in symbols.iter().zip(shape) {
+            if !symbol.is_empty() {
+                builder = builder.with_dimension_override(symbol, size as i64)?;
             }
         }
-        if let Some(ep) = provider(self.backend, self.config.device_id)? {
-            builder = builder.with_execution_providers([ep])?;
+    }
+    if let Some(ep) = provider(backend, config.device_id)? {
+        builder = builder.with_execution_providers([ep])?;
+    }
+    Ok(builder.commit_from_memory(bytes)?)
+}
+
+impl Model {
+    fn build(&self, shape: Option<&[usize]>) -> Result<Session> {
+        build_session(&self.bytes, self.backend, &self.config, &self.symbols, shape)
+    }
+    /// Build the sessions for `shapes` that are not cached yet (per-shape backends only; the
+    /// others have their one session already), concurrently where `parallel_build` allows.
+    /// Called from a thread while another model does the same, so it takes the plain parts.
+    fn build_shapes(&self, shapes: &[[usize; 4]]) -> Result<Vec<([usize; 4], Session)>> {
+        let missing: Vec<[usize; 4]> = shapes
+            .iter()
+            .copied()
+            .filter(|shape| !self.sessions.iter().any(|(s, _)| s == shape))
+            .collect();
+        if !per_shape(self.backend) || missing.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(builder.commit_from_memory(&self.bytes)?)
+        let build = |shape: [usize; 4]| -> Result<([usize; 4], Session)> {
+            Ok((shape, self.build(Some(&shape))?))
+        };
+        if !parallel_build(self.backend) || missing.len() == 1 {
+            return missing.into_iter().map(build).collect();
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = missing.iter().map(|&shape| scope.spawn(move || build(shape))).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(Error::ModelContract("session build panicked".into()))))
+                .collect()
+        })
+    }
+    /// Cache sessions from `build_shapes`, most recently built first.
+    fn adopt(&mut self, built: Vec<([usize; 4], Session)>) {
+        for (shape, session) in built {
+            self.sessions.retain(|(s, _)| s != &shape);
+            self.sessions.truncate(self.capacity.saturating_sub(1));
+            self.sessions.insert(0, (shape.to_vec(), session));
+        }
     }
     fn open(bytes: Vec<u8>, backend: Backend, config: &Config, capacity: usize) -> Result<Self> {
         let mut model = Self {
@@ -118,7 +171,15 @@ impl Model {
             compact: false,
             declared_classes: None,
         };
-        // The dynamic session supplies the dimension names; per-shape backends then drop it.
+        if per_shape(backend) {
+            // Every session is pinned, so the dimension names come from the file: a dynamic
+            // session built only to read them would cost ~300 ms per model on DirectML.
+            model.symbols = crate::onnx::input_symbols(&model.bytes)?;
+            if model.symbols.len() != 4 {
+                return Err(Error::ModelContract(format!("model input with {} axes is not NCHW", model.symbols.len())));
+            }
+            return Ok(model);
+        }
         let session = model.build(None)?;
         let ValueType::Tensor { dimension_symbols, shape, .. } = &session.inputs[0].input_type else {
             return Err(Error::ModelContract("model input is not a tensor".into()));
@@ -127,9 +188,7 @@ impl Model {
             return Err(Error::ModelContract(format!("model input {shape:?} is not NCHW")));
         }
         model.symbols = dimension_symbols.iter().map(|s| s.to_string()).collect();
-        if !per_shape(backend) {
-            model.sessions.push((Vec::new(), session));
-        }
+        model.sessions.push((Vec::new(), session));
         Ok(model)
     }
     /// The session for `shape`, built (and the least recently used evicted) on first use.
@@ -212,10 +271,18 @@ fn recognizer(path: &std::path::Path, backend: Backend, config: &Config) -> Resu
 /// Input shapes exercised at load: they prove the backend works (some Windows adapters accept
 /// DirectML sessions but fail on the first inference) and pre-build the common sessions.
 const DETECTION_WARM: [usize; 4] = [1, 3, 544, 960];
+/// Detector sessions kept on per-shape backends: one per capture size seen lately. Each costs
+/// about 650 ms to build on a GTX 1080, so alternating between a few capture regions or window
+/// sizes must not rebuild them every scan.
+const DETECTION_SESSIONS: usize = 4;
 
 pub(crate) fn load(models: &ModelPaths, config: &Config) -> Result<(Model, Model, BackendInfo)> {
     let mut candidates = Vec::new();
     if config.backend == Backend::Auto {
+        // Only providers the loaded ONNX Runtime was built with: Kimochi's Windows runtime is
+        // the DirectML build, so CUDA would otherwise be tried (and fail on a missing provider
+        // library) before DirectML on every load.
+        let available = |ep: &dyn ExecutionProvider| ep.is_available().unwrap_or(false);
         if cfg!(all(
             target_os = "macos",
             target_arch = "aarch64",
@@ -223,13 +290,16 @@ pub(crate) fn load(models: &ModelPaths, config: &Config) -> Result<(Model, Model
         )) {
             candidates.push(Backend::CoreMl);
         }
-        if cfg!(all(
-            any(target_os = "windows", target_os = "linux"),
-            feature = "cuda"
-        )) {
+        #[cfg(feature = "cuda")]
+        if cfg!(any(target_os = "windows", target_os = "linux"))
+            && available(&ort::execution_providers::CUDAExecutionProvider::default())
+        {
             candidates.push(Backend::Cuda);
         }
-        if cfg!(all(target_os = "windows", feature = "directml")) {
+        #[cfg(feature = "directml")]
+        if cfg!(target_os = "windows")
+            && available(&ort::execution_providers::DirectMLExecutionProvider::default())
+        {
             candidates.push(Backend::DirectMl);
         }
         candidates.push(Backend::Cpu);
@@ -239,8 +309,28 @@ pub(crate) fn load(models: &ModelPaths, config: &Config) -> Result<(Model, Model
     let mut reasons = Vec::new();
     for backend in candidates {
         let attempt = (|| {
-            let mut det = Model::open(read(&models.detection)?, backend, config, 2)?;
+            let mut det = Model::open(read(&models.detection)?, backend, config, DETECTION_SESSIONS)?;
             let mut rec = recognizer(&models.recognition, backend, config)?;
+            if per_shape(backend) {
+                // The warm-up sessions, the detector's and the recognizer's side by side where
+                // the backend allows it (and each recognizer width on its own thread in turn).
+                let rec_shapes: Vec<[usize; 4]> =
+                    crate::rec::WARM_WIDTHS.iter().map(|&w| [1, 3, crate::rec::HEIGHT, w]).collect();
+                let (det_built, rec_built) = if parallel_build(backend) {
+                    std::thread::scope(|scope| {
+                        let d = scope.spawn(|| det.build_shapes(&[DETECTION_WARM]));
+                        let r = scope.spawn(|| rec.build_shapes(&rec_shapes));
+                        let join = |h: std::thread::ScopedJoinHandle<'_, Result<_>>| {
+                            h.join().unwrap_or_else(|_| Err(Error::ModelContract("session build panicked".into())))
+                        };
+                        (join(d), join(r))
+                    })
+                } else {
+                    (det.build_shapes(&[DETECTION_WARM]), rec.build_shapes(&rec_shapes))
+                };
+                det.adopt(det_built?);
+                rec.adopt(rec_built?);
+            }
             if backend != Backend::Cpu {
                 det.run(Array4::zeros(DETECTION_WARM), |_, _| Ok(())).map_err(|err| {
                     Error::ModelContract(format!("{backend:?} detection inference probe failed: {err}"))
